@@ -49,26 +49,41 @@ namespace NoVikingLeftBehind
     /// disagree. The two modules also live in different declaring types, which is what keeps their
     /// Harmony __state slots separate.
     ///
-    /// "REQUIRE ONLY ONE INGREDIENT" RECIPES (0.10.0)
-    /// ------------------------------------------------
+    /// TWO "HAVE REQUIREMENTS" METHODS (0.10.1 - field report: craft button grey with the panel
+    /// showing more than enough, containers stocked, on Valheim 1.0.12)
+    /// ------------------------------------------------------------------------------------------
+    /// Player has a PUBLIC HaveRequirements(Recipe, bool, int, int) - patched below as
+    /// HaveRecipePost - and a separate PRIVATE inner HaveRequirementItems(Recipe, bool, int, int)
+    /// that actually walks the ingredient list; the public one calls the private one after its own
+    /// station/DLC checks. THE CRAFTING PANEL'S LIVE BUTTON STATE POLLS THE INNER METHOD DIRECTLY,
+    /// not the outer wrapper - confirmed against AzuCraftyBoxes (github.com/AzumattDev/
+    /// AzuCraftyBoxes), which patches both for exactly this reason. Until this version, this
+    /// module patched only the outer HaveRequirements: the craft button never saw a container at
+    /// all, on any recipe, and the field report's diagnostics (which live in HaveRecipePost) never
+    /// logged a single line even for a definitely-short recipe, because the button's own check
+    /// never went near our patch. HaveRequirementItemsPost below closes that gap, sharing its
+    /// ingredient test with HaveRecipePost via HaveIngredients() so the two can never disagree.
+    ///
+    /// "REQUIRE ONLY ONE INGREDIENT" RECIPES
+    /// --------------------------------------
     /// A recipe with m_requireOnlyOneIngredient wants any ONE of its listed items, not all of them,
     /// and vanilla picks the concrete item via Player.GetFirstRequiredItem - which only ever looked
-    /// at the player's own inventory. Two patches keep this consistent with everything above:
+    /// at the player's own inventory. HaveIngredients() (shared by both patches above) accepts the
+    /// first listed item that clears the needed amount from inventory+containers, so the button
+    /// agrees with what a real craft can actually get.
     ///
-    ///   HaveRecipePost, for these recipes, checks each listed item against inventory+containers
-    ///   (still just Available(), still read-only) and accepts the first one that clears the
-    ///   needed amount - so the craft button agrees with what a real craft can actually get.
-    ///
-    ///   GetFirstRequiredItemPost fires when vanilla found nothing in the inventory: it looks for
-    ///   the first listed item a nearby container can supply and returns a DETACHED CLONE of it,
-    ///   exactly the trick CookingFindCookablePost already uses - vanilla's own removal, aimed at
-    ///   an item that was never really in the bag, harmlessly finds nothing to remove. Unlike the
-    ///   cooking patch, this one never calls ChestSource.Consume itself: it is read-only on
-    ///   purpose, because GetFirstRequiredItem is also polled just to grey/ungrey the button, and a
-    ///   container must never drain from being looked at. The actual debit happens exactly once,
-    ///   generically, when DoCrafting goes on to call Player.ConsumeResources with a one-item
-    ///   Requirement[] built around whatever item this method handed back - the existing
-    ///   ConsumePre/ConsumePost measuring below does the rest, unchanged.
+    /// GetFirstRequiredItemPost fires when vanilla found nothing in the inventory: it looks for the
+    /// first listed item a nearby container can supply and returns a DETACHED CLONE of it, the same
+    /// trick CookingFindCookablePost uses so vanilla's own removal - aimed at an item that was never
+    /// really in the bag - harmlessly finds nothing to remove. It is deliberately READ-ONLY: this
+    /// method, like HaveRequirementItems, is polled far more often than a real craft happens, so it
+    /// never calls ChestSource.Consume itself. AzuCraftyBoxes' source shows why that matters here
+    /// specifically: DoCrafting does NOT route a one-ingredient recipe's consumption through the
+    /// generic Player.ConsumeResources(Requirement[], ...) that ConsumePost already measures below -
+    /// it must be debited separately, or the container would never actually lose the item (free
+    /// crafting). So GetFirstRequiredItemPost only QUEUES the pull (_pendingPull, at most one at a
+    /// time), and DoCraftingPost - a postfix on InventoryGui.DoCrafting, which only ever runs on a
+    /// real craft since a greyed button cannot be clicked - flushes it, exactly once, for real.
     /// </summary>
     internal sealed class CraftFromChestsModule : FeatureModule
     {
@@ -97,6 +112,31 @@ namespace NoVikingLeftBehind
         private static string _lastDiag;
         private static float _lastDiagAt;
         private static ConfigEntry<string> _toggleKey;
+
+        /// <summary>
+        /// A single queued container pull for a "require only one ingredient" recipe, set by
+        /// GetFirstRequiredItemPost (read-only) and flushed by DoCraftingPost (the actual debit).
+        /// At most one at a time, mirroring AzuCraftyBoxes' own "only queue if empty" guard: a
+        /// stale entry from a mere poll is just overwritten or discarded, never itself consuming
+        /// anything - see the class doc comment.
+        /// </summary>
+        private struct PendingPull
+        {
+            public string SharedName;
+            public int Amount;
+            public int Quality;
+        }
+        private static PendingPull? _pendingPull;
+
+        /// <summary>
+        /// Piece.Requirement.m_extraAmountOnlyOneIngredient, resolved by name via AccessTools so a
+        /// mismatch against this specific game build cannot fail the whole file to compile or abort
+        /// ApplyPatches() - it can only ever come back null, in which case GetFirstRequiredItemPost
+        /// simply leaves `extraAmount` alone (its pre-existing behaviour), the field name having
+        /// only been confirmed against AzuCraftyBoxes' own build, not this one.
+        /// </summary>
+        private static readonly System.Reflection.FieldInfo _extraAmountField =
+            AccessTools.Field(typeof(Piece.Requirement), "m_extraAmountOnlyOneIngredient");
 
         /// <summary>Per-player kill switch behind ToggleKey. Never synced, never persisted.</summary>
         private static bool _userOn = true;
@@ -329,12 +369,53 @@ namespace NoVikingLeftBehind
                  "Player.HaveRequirements(Recipe,bool,int,int)");
             Harmony.Patch(m, postfix: M(nameof(HaveRecipePost)));
 
+            // THE crafting-panel button state: see the class doc comment ("TWO 'HAVE REQUIREMENTS'
+            // METHODS"). This is a PRIVATE method with the same visible name pattern as the public
+            // one above but a different identifier (HaveRequirementItems); AzuCraftyBoxes patches
+            // it under that exact name. Wrapped defensively - if a future Valheim build renames or
+            // reshapes it, the rest of this module (including the HaveRequirements patch above)
+            // still installs rather than the whole module going dark over one missing method.
+            try
+            {
+                var hri = AccessTools.Method(typeof(Player), "HaveRequirementItems",
+                                              new[] { typeof(Recipe), typeof(bool), typeof(int), typeof(int) });
+                if (hri == null) throw new Exception("method not found");
+                Harmony.Patch(hri, postfix: M(nameof(HaveRequirementItemsPost)));
+            }
+            catch (Exception e)
+            {
+                Log.LogWarning("[Chests] could not patch Player.HaveRequirementItems(Recipe,bool,int,int) - " +
+                               "the crafting panel's Craft button may keep ignoring nearby containers on " +
+                               "this game version even though the check above works: " + e.Message);
+            }
+
             // "Require only one ingredient" recipes (e.g. some cauldron/cooking-pot recipes) pick
             // their concrete item here instead of walking m_resources - see the class doc comment.
             // Only one overload exists; TrailingTierDiscount resolves it the same untyped way.
-            m = AccessTools.Method(typeof(Player), "GetFirstRequiredItem");
-            if (m == null) throw new Exception("Player.GetFirstRequiredItem not found");
-            Harmony.Patch(m, postfix: M(nameof(GetFirstRequiredItemPost)));
+            // Wrapped defensively like HaveRequirementItems above: GetFirstRequiredItemPost's
+            // signature includes `ref int amount`/`ref int extraAmount`, confirmed against
+            // AzuCraftyBoxes' own patch but not independently against this exact game build, so a
+            // mismatch here must not take the rest of ApplyPatches() (including the fix above, for
+            // ordinary multi-ingredient recipes) down with it - only this one, narrower,
+            // "require only one ingredient" pull would be missing.
+            try
+            {
+                var gfri = AccessTools.Method(typeof(Player), "GetFirstRequiredItem");
+                if (gfri == null) throw new Exception("method not found");
+                Harmony.Patch(gfri, postfix: M(nameof(GetFirstRequiredItemPost)));
+            }
+            catch (Exception e)
+            {
+                Log.LogWarning("[Chests] could not patch Player.GetFirstRequiredItem - " +
+                               "\"require only one ingredient\" recipes (some cauldron/cooking-pot " +
+                               "recipes) may not offer a container's items when the bag is empty, on " +
+                               "this game version: " + e.Message);
+            }
+
+            // Flushes the one queued container pull from GetFirstRequiredItemPost, for real, once -
+            // see the class doc comment for why this can't just reuse ConsumeResources.
+            Need(ref m, typeof(InventoryGui), "DoCrafting", new[] { typeof(Player) }, "InventoryGui.DoCrafting(Player)");
+            Harmony.Patch(m, postfix: M(nameof(DoCraftingPost)));
 
             // --- building -------------------------------------------------------------------------
             Need(ref m, typeof(Player), "HaveRequirements",
@@ -460,51 +541,9 @@ namespace NoVikingLeftBehind
                 var boxes = ChestSource.Nearby(__instance.transform.position);
                 if (boxes.Count == 0) { Diag(recipe, "no containers in range"); return; }
 
-                // "Only one ingredient" recipes want ANY ONE of the listed items, not all of them.
-                // GetFirstRequiredItemPost applies the exact same inventory-then-containers test
-                // when DoCrafting actually picks a concrete item to consume, so accepting here can
-                // never promise something the craft itself then fails to find.
-                if (recipe.m_requireOnlyOneIngredient)
-                {
-                    var sb0 = _diag != null && _diag.Value ? new StringBuilder() : null;
-                    int need0 = Mathf.Max(1, amount);
-                    foreach (var req in recipe.m_resources)
-                    {
-                        if (req == null || !req.m_resItem) continue;
-                        int have0 = Available(__instance, req, need0, boxes);
-                        if (sb0 != null) sb0.Append(req.m_resItem.m_itemData.m_shared.m_name).Append(' ').Append(have0).Append('/').Append(need0).Append(' ');
-                        if (have0 >= need0)
-                        {
-                            __result = true;
-                            Diag(recipe, "OK (requireOnlyOneIngredient) from inventory/containers: " + sb0);
-                            return;
-                        }
-                    }
-                    Diag(recipe, "requireOnlyOneIngredient short in inventory and containers: " + sb0);
-                    return;
-                }
-
-                var sb = _diag != null && _diag.Value ? new StringBuilder() : null;
-                foreach (var req in recipe.m_resources)
-                {
-                    if (req == null || !req.m_resItem) continue;
-                    int need = req.GetAmount(qualityLevel) * amount;
-                    if (need <= 0) continue;
-                    int have = Available(__instance, req, need, boxes);
-                    if (sb != null) sb.Append(req.m_resItem.m_itemData.m_shared.m_name).Append(' ').Append(have).Append('/').Append(need).Append(' ');
-                    if (have < need)
-                    {
-                        Diag(recipe, "short: " + sb + "(boxes=" + boxes.Count + ", bag=" +
-                                     __instance.m_inventory.CountItems(req.m_resItem.m_itemData.m_shared.m_name) +
-                                     ", chests q-1=" + ChestSource.Count(req.m_resItem.m_itemData.m_shared.m_name, boxes) +
-                                     ", chests q1=" + ChestSource.Count(req.m_resItem.m_itemData.m_shared.m_name, boxes, 1) +
-                                     ", maxQ=" + req.m_resItem.m_itemData.m_shared.m_maxQuality + ")");
-                        return;
-                    }
-                }
-
-                __result = true;
-                Diag(recipe, "OK from containers: " + sb);
+                string why;
+                __result = HaveIngredients(__instance, recipe, qualityLevel, amount, boxes, out why);
+                Diag(recipe, why);
             }
             catch (Exception e)
             {
@@ -514,22 +553,119 @@ namespace NoVikingLeftBehind
         }
 
         /// <summary>
+        /// THE method the crafting panel polls to grey/ungrey the Craft button - see the class doc
+        /// comment ("TWO 'HAVE REQUIREMENTS' METHODS"). No station/DLC checks here on purpose: this
+        /// inner method's own job in vanilla is just the ingredient test, and HaveRecipePost above
+        /// (or vanilla itself, for whatever calls the outer wrapper directly) already covers those
+        /// around it - duplicating them here would be redundant, not wrong, but this keeps the two
+        /// patches doing exactly one job each, the same way ConsumePre/ConsumePost do.
+        /// </summary>
+        private static void HaveRequirementItemsPost(Player __instance, Recipe piece, bool discover,
+                                                     int qualityLevel, int amount, ref bool __result)
+        {
+            if (__result) return;
+            if (discover) return;
+            if (!Live() || !_pullCrafting.Value) return;
+            if (__instance != Player.m_localPlayer) return;
+            if (piece == null || piece.m_resources == null) return;
+
+            try
+            {
+                var boxes = ChestSource.Nearby(__instance.transform.position);
+                if (boxes.Count == 0) return;
+
+                string why;
+                __result = HaveIngredients(__instance, piece, qualityLevel, amount, boxes, out why);
+                Diag(piece, "[button] " + why);
+            }
+            catch (Exception e)
+            {
+                Log.LogWarning("[Chests] HaveRequirementItems(Recipe) postfix: " + e.Message);
+            }
+        }
+
+        /// <summary>
+        /// The chest-aware "do you have the materials" test, shared by HaveRecipePost and
+        /// HaveRequirementItemsPost so the two can never disagree. Read-only: only counts
+        /// containers, never touches one. <paramref name="why"/> is always set, for Diag().
+        /// </summary>
+        private static bool HaveIngredients(Player player, Recipe recipe, int qualityLevel, int amount,
+                                            List<Box> boxes, out string why)
+        {
+            var sb = _diag != null && _diag.Value ? new StringBuilder() : null;
+
+            // "Only one ingredient" recipes want ANY ONE of the listed items, not all of them - but
+            // still the recipe's own GetAmount(qualityLevel) of whichever one is picked, times the
+            // batch multiplier. GetFirstRequiredItemPost applies the exact same per-item amount and
+            // inventory-then-containers test when DoCrafting actually picks a concrete item to
+            // consume, so accepting here can never promise something the craft itself then fails to
+            // find.
+            if (recipe.m_requireOnlyOneIngredient)
+            {
+                foreach (var req in recipe.m_resources)
+                {
+                    if (req == null || !req.m_resItem) continue;
+                    int need0 = req.GetAmount(qualityLevel) * amount;
+                    if (need0 <= 0) continue;
+                    int have0 = Available(player, req, need0, boxes);
+                    if (sb != null) sb.Append(req.m_resItem.m_itemData.m_shared.m_name).Append(' ').Append(have0).Append('/').Append(need0).Append(' ');
+                    if (have0 >= need0)
+                    {
+                        why = "OK (requireOnlyOneIngredient) from inventory/containers: " + sb;
+                        return true;
+                    }
+                }
+                why = "requireOnlyOneIngredient short in inventory and containers: " + sb;
+                return false;
+            }
+
+            foreach (var req in recipe.m_resources)
+            {
+                if (req == null || !req.m_resItem) continue;
+                int need = req.GetAmount(qualityLevel) * amount;
+                if (need <= 0) continue;
+                int have = Available(player, req, need, boxes);
+                if (sb != null) sb.Append(req.m_resItem.m_itemData.m_shared.m_name).Append(' ').Append(have).Append('/').Append(need).Append(' ');
+                if (have < need)
+                {
+                    why = "short: " + sb + "(boxes=" + boxes.Count + ", bag=" +
+                          player.m_inventory.CountItems(req.m_resItem.m_itemData.m_shared.m_name) +
+                          ", chests q-1=" + ChestSource.Count(req.m_resItem.m_itemData.m_shared.m_name, boxes) +
+                          ", chests q1=" + ChestSource.Count(req.m_resItem.m_itemData.m_shared.m_name, boxes, 1) +
+                          ", maxQ=" + req.m_resItem.m_itemData.m_shared.m_maxQuality + ")";
+                    return false;
+                }
+            }
+
+            why = "OK from containers: " + sb;
+            return true;
+        }
+
+        /// <summary>
         /// The "require only one ingredient" path: vanilla's Player.GetFirstRequiredItem picks the
         /// concrete ItemData that gets consumed, but only ever looked at the player's own
         /// inventory. If it found nothing, offer the first listed item a nearby container can
-        /// supply, as a DETACHED CLONE - the same trick as CookingFindCookablePost, and for the
-        /// same reason: vanilla's later removal targets an ItemData that was never really in the
-        /// bag and harmlessly finds nothing to remove.
+        /// supply IN FULL (the same GetAmount(qualityLevel) * craftMultiplier that HaveIngredients
+        /// already checked), as a DETACHED CLONE - the same trick as CookingFindCookablePost, and
+        /// for the same reason: vanilla's later removal targets an ItemData that was never really
+        /// in the bag and harmlessly finds nothing to remove.
         ///
-        /// Deliberately READ-ONLY: no ChestSource.Consume here. This method is also what
-        /// HaveRequirements polls every time the crafting panel repaints (far more often than a
-        /// real craft happens), so touching the container here would drain it just from the button
-        /// being on screen. The real debit happens once, generically, when DoCrafting goes on to
-        /// call Player.ConsumeResources with a one-item Requirement[] built around whatever this
-        /// method returns - ConsumePre/ConsumePost measure and pull that exactly like any other
-        /// recipe.
+        /// amount/extraAmount are `ref` on the real method (confirmed against AzuCraftyBoxes' own
+        /// patch, which is why this signature mirrors its parameter names/types exactly even though
+        /// it drops the unused `inventory` one - Harmony binds a postfix by name, not position).
+        /// Vanilla's caller uses the returned amount to know how much of __result to take, so it
+        /// must be set to the real requirement, not left at whatever it held when nothing was found
+        /// in the bag - and extraAmount must carry over the recipe's own bonus-yield hint.
+        ///
+        /// Deliberately READ-ONLY: no ChestSource.Consume here. This method, like
+        /// HaveRequirementItems, is polled far more often than a real craft happens, so touching a
+        /// container here would drain it just from the button being on screen. It only QUEUES the
+        /// pull (_pendingPull); DoCraftingPost below performs the actual, one-time debit - see the
+        /// class doc comment for why this can't reuse ConsumeResources like every other recipe does.
         /// </summary>
-        private static void GetFirstRequiredItemPost(Recipe recipe, ref ItemDrop.ItemData __result)
+        private static void GetFirstRequiredItemPost(Recipe recipe, int qualityLevel, ref int amount,
+                                                      ref int extraAmount, int craftMultiplier,
+                                                      ref ItemDrop.ItemData __result)
         {
             if (__result != null) return;
             if (!Live() || !_pullCrafting.Value) return;
@@ -546,22 +682,68 @@ namespace NoVikingLeftBehind
                 foreach (var req in recipe.m_resources)
                 {
                     if (req == null || !req.m_resItem) continue;
+                    int need = req.GetAmount(qualityLevel) * craftMultiplier;
+                    if (need <= 0) continue;
+
                     string shared = req.m_resItem.m_itemData.m_shared.m_name;
                     string prefab = Utils.GetPrefabName(req.m_resItem.gameObject);
                     if (ChestSource.ItemBlocked(prefab, shared)) continue;
-                    if (ChestSource.Count(shared, boxes) <= 0) continue;
+                    if (ChestSource.Count(shared, boxes) < need) continue;
 
                     var data = req.m_resItem.m_itemData.Clone();
-                    data.m_stack = 1;
+                    data.m_stack = need;
                     data.m_dropPrefab = req.m_resItem.gameObject;
                     __result = data;
-                    Diag(recipe, "GetFirstRequiredItem offering " + shared + " from a container");
+                    amount = need;
+                    if (_extraAmountField != null)
+                    {
+                        try { extraAmount = (int)_extraAmountField.GetValue(req); }
+                        catch { /* leave extraAmount as vanilla set it */ }
+                    }
+
+                    if (_pendingPull == null)
+                        _pendingPull = new PendingPull { SharedName = shared, Amount = need, Quality = data.m_quality };
+
+                    Diag(recipe, "GetFirstRequiredItem offering " + need + "x " + shared + " from a container");
                     return;
                 }
             }
             catch (Exception e)
             {
                 Log.LogWarning("[Chests] Player.GetFirstRequiredItem postfix: " + e.Message);
+            }
+        }
+
+        /// <summary>
+        /// Flushes the one pending "require only one ingredient" container pull queued by
+        /// GetFirstRequiredItemPost, if any - see the class doc comment. DoCrafting only ever runs
+        /// on a REAL craft (a greyed button cannot be clicked), so this is the one safe,
+        /// guaranteed-once place to actually debit the container. Always clears the slot first,
+        /// so a queued-but-never-crafted entry cannot leak into a later, unrelated craft.
+        /// </summary>
+        private static void DoCraftingPost(InventoryGui __instance)
+        {
+            var pending = _pendingPull;
+            _pendingPull = null;
+            if (pending == null) return;
+            if (!Live() || !_pullCrafting.Value) return;
+
+            try
+            {
+                var player = Player.m_localPlayer;
+                if (player == null) return;
+                var boxes = ChestSource.Nearby(player.transform.position);
+                if (boxes.Count == 0) return;
+
+                var p = pending.Value;
+                int got = ChestSource.Consume(p.SharedName, p.Amount, p.Quality, boxes);
+                if (got < p.Amount)
+                    Log.LogWarning("[Chests] only " + got + "/" + p.Amount + " " + p.SharedName +
+                                   " came out of nearby containers for a one-ingredient recipe");
+            }
+            catch (Exception e)
+            {
+                Log.LogWarning("[Chests] DoCrafting postfix (one-ingredient pull): " + e.Message);
             }
         }
 
