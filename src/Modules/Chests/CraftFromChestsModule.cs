@@ -48,6 +48,27 @@ namespace NoVikingLeftBehind
     /// between the two modules (or a third mod) can make the counted, shown and consumed numbers
     /// disagree. The two modules also live in different declaring types, which is what keeps their
     /// Harmony __state slots separate.
+    ///
+    /// "REQUIRE ONLY ONE INGREDIENT" RECIPES (0.10.0)
+    /// ------------------------------------------------
+    /// A recipe with m_requireOnlyOneIngredient wants any ONE of its listed items, not all of them,
+    /// and vanilla picks the concrete item via Player.GetFirstRequiredItem - which only ever looked
+    /// at the player's own inventory. Two patches keep this consistent with everything above:
+    ///
+    ///   HaveRecipePost, for these recipes, checks each listed item against inventory+containers
+    ///   (still just Available(), still read-only) and accepts the first one that clears the
+    ///   needed amount - so the craft button agrees with what a real craft can actually get.
+    ///
+    ///   GetFirstRequiredItemPost fires when vanilla found nothing in the inventory: it looks for
+    ///   the first listed item a nearby container can supply and returns a DETACHED CLONE of it,
+    ///   exactly the trick CookingFindCookablePost already uses - vanilla's own removal, aimed at
+    ///   an item that was never really in the bag, harmlessly finds nothing to remove. Unlike the
+    ///   cooking patch, this one never calls ChestSource.Consume itself: it is read-only on
+    ///   purpose, because GetFirstRequiredItem is also polled just to grey/ungrey the button, and a
+    ///   container must never drain from being looked at. The actual debit happens exactly once,
+    ///   generically, when DoCrafting goes on to call Player.ConsumeResources with a one-item
+    ///   Requirement[] built around whatever item this method handed back - the existing
+    ///   ConsumePre/ConsumePost measuring below does the rest, unchanged.
     /// </summary>
     internal sealed class CraftFromChestsModule : FeatureModule
     {
@@ -308,6 +329,13 @@ namespace NoVikingLeftBehind
                  "Player.HaveRequirements(Recipe,bool,int,int)");
             Harmony.Patch(m, postfix: M(nameof(HaveRecipePost)));
 
+            // "Require only one ingredient" recipes (e.g. some cauldron/cooking-pot recipes) pick
+            // their concrete item here instead of walking m_resources - see the class doc comment.
+            // Only one overload exists; TrailingTierDiscount resolves it the same untyped way.
+            m = AccessTools.Method(typeof(Player), "GetFirstRequiredItem");
+            if (m == null) throw new Exception("Player.GetFirstRequiredItem not found");
+            Harmony.Patch(m, postfix: M(nameof(GetFirstRequiredItemPost)));
+
             // --- building -------------------------------------------------------------------------
             Need(ref m, typeof(Player), "HaveRequirements",
                  new[] { typeof(Piece), typeof(Player.RequirementMode) },
@@ -416,12 +444,6 @@ namespace NoVikingLeftBehind
             if (__instance != Player.m_localPlayer) { Diag(recipe, "not the local player"); return; }
             if (recipe == null || recipe.m_resources == null || recipe.m_item == null) return;
 
-            // "Only one ingredient" recipes pick a concrete ItemData in Player.GetFirstRequiredItem
-            // and DoCrafting silently does nothing when that comes back null. Saying "yes you can"
-            // here without also producing that item would give a dead craft button, so these stay
-            // vanilla: they craft from the player's own inventory only.
-            if (recipe.m_requireOnlyOneIngredient) { Diag(recipe, "requireOnlyOneIngredient -> vanilla"); return; }
-
             try
             {
                 // Vanilla returned false; it may have been the station or the DLC, not the items.
@@ -437,6 +459,30 @@ namespace NoVikingLeftBehind
 
                 var boxes = ChestSource.Nearby(__instance.transform.position);
                 if (boxes.Count == 0) { Diag(recipe, "no containers in range"); return; }
+
+                // "Only one ingredient" recipes want ANY ONE of the listed items, not all of them.
+                // GetFirstRequiredItemPost applies the exact same inventory-then-containers test
+                // when DoCrafting actually picks a concrete item to consume, so accepting here can
+                // never promise something the craft itself then fails to find.
+                if (recipe.m_requireOnlyOneIngredient)
+                {
+                    var sb0 = _diag != null && _diag.Value ? new StringBuilder() : null;
+                    int need0 = Mathf.Max(1, amount);
+                    foreach (var req in recipe.m_resources)
+                    {
+                        if (req == null || !req.m_resItem) continue;
+                        int have0 = Available(__instance, req, need0, boxes);
+                        if (sb0 != null) sb0.Append(req.m_resItem.m_itemData.m_shared.m_name).Append(' ').Append(have0).Append('/').Append(need0).Append(' ');
+                        if (have0 >= need0)
+                        {
+                            __result = true;
+                            Diag(recipe, "OK (requireOnlyOneIngredient) from inventory/containers: " + sb0);
+                            return;
+                        }
+                    }
+                    Diag(recipe, "requireOnlyOneIngredient short in inventory and containers: " + sb0);
+                    return;
+                }
 
                 var sb = _diag != null && _diag.Value ? new StringBuilder() : null;
                 foreach (var req in recipe.m_resources)
@@ -464,6 +510,58 @@ namespace NoVikingLeftBehind
             {
                 Log.LogWarning("[Chests] HaveRequirements(Recipe) postfix: " + e.Message);
                 Diag(recipe, "exception " + e.GetType().Name);
+            }
+        }
+
+        /// <summary>
+        /// The "require only one ingredient" path: vanilla's Player.GetFirstRequiredItem picks the
+        /// concrete ItemData that gets consumed, but only ever looked at the player's own
+        /// inventory. If it found nothing, offer the first listed item a nearby container can
+        /// supply, as a DETACHED CLONE - the same trick as CookingFindCookablePost, and for the
+        /// same reason: vanilla's later removal targets an ItemData that was never really in the
+        /// bag and harmlessly finds nothing to remove.
+        ///
+        /// Deliberately READ-ONLY: no ChestSource.Consume here. This method is also what
+        /// HaveRequirements polls every time the crafting panel repaints (far more often than a
+        /// real craft happens), so touching the container here would drain it just from the button
+        /// being on screen. The real debit happens once, generically, when DoCrafting goes on to
+        /// call Player.ConsumeResources with a one-item Requirement[] built around whatever this
+        /// method returns - ConsumePre/ConsumePost measure and pull that exactly like any other
+        /// recipe.
+        /// </summary>
+        private static void GetFirstRequiredItemPost(Recipe recipe, ref ItemDrop.ItemData __result)
+        {
+            if (__result != null) return;
+            if (!Live() || !_pullCrafting.Value) return;
+            if (recipe == null || !recipe.m_requireOnlyOneIngredient || recipe.m_resources == null) return;
+
+            var player = Player.m_localPlayer;
+            if (player == null) return;
+
+            try
+            {
+                var boxes = ChestSource.Nearby(player.transform.position);
+                if (boxes.Count == 0) return;
+
+                foreach (var req in recipe.m_resources)
+                {
+                    if (req == null || !req.m_resItem) continue;
+                    string shared = req.m_resItem.m_itemData.m_shared.m_name;
+                    string prefab = Utils.GetPrefabName(req.m_resItem.gameObject);
+                    if (ChestSource.ItemBlocked(prefab, shared)) continue;
+                    if (ChestSource.Count(shared, boxes) <= 0) continue;
+
+                    var data = req.m_resItem.m_itemData.Clone();
+                    data.m_stack = 1;
+                    data.m_dropPrefab = req.m_resItem.gameObject;
+                    __result = data;
+                    Diag(recipe, "GetFirstRequiredItem offering " + shared + " from a container");
+                    return;
+                }
+            }
+            catch (Exception e)
+            {
+                Log.LogWarning("[Chests] Player.GetFirstRequiredItem postfix: " + e.Message);
             }
         }
 
