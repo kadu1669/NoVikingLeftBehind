@@ -593,21 +593,21 @@ namespace NoVikingLeftBehind
         /// and flint in nearby chests, but craftable the instant every material - including this
         /// one - sits in the bag instead)
         /// ------------------------------------------------------------------------------------------
-        /// A Piece.Requirement can carry an `m_upgraderResource` - vanilla's own marker for "this slot
-        /// is waived once the right crafting-station extension/upgrade is attached", checked against
-        /// the current CraftingStation's own `m_upgrader`. Confirmed straight from Valheim's own
-        /// Player.HaveRequirementItems and Player.ConsumeResources (disassembled from the field
-        /// report's own game build, not inferred from a reference mod): both silently SKIP a
-        /// requirement whenever `station.m_upgrader == req.m_upgraderResource` (station has the
-        /// matching extension) or the player isn't at any station at all while the requirement carries
-        /// an upgrader resource. Skipped means skipped outright - no item, anywhere, ever needs to
-        /// satisfy it. Before this fix, HaveIngredients had no idea this waiver existed and treated
-        /// every such slot as an ordinary ingredient, checking inventory+containers for a "resource"
-        /// that is often a display/marker item nobody can ever actually carry - so the recipe stayed
-        /// permanently short specifically because of a requirement vanilla itself doesn't enforce. This
-        /// is also exactly why plain vanilla (or a well-behaved chest mod) crafted it fine once the
-        /// real materials reached the bag: vanilla's own waiver already covered this slot, and our
-        /// override, run only after vanilla itself said "no", was the one re-introducing it.
+        /// A Piece.Requirement can carry an `m_upgraderResource` - vanilla's own marker tying a slot
+        /// to a specific crafting-station extension/upgrade, checked against the current
+        /// CraftingStation's own `m_upgrader`. Confirmed straight from Valheim's own
+        /// Player.HaveRequirementItems, Player.GetFirstRequiredItem and Player.ConsumeResources
+        /// (disassembled from the field report's own game build, not inferred from a reference mod):
+        /// all three silently SKIP a requirement whenever `station.m_upgrader != req.m_upgraderResource`
+        /// - the player is at a station, but it does not carry the matching extension - or the player
+        /// isn't at any station at all while the requirement carries an upgrader resource. When the
+        /// tags DO match (including the ordinary case of both being null - a plain ingredient with no
+        /// station in play) the slot is enforced completely normally, exactly like any other resource.
+        /// Skipped means skipped outright - no item, anywhere, ever needs to satisfy it. An earlier
+        /// version of this fix had the comparison backwards (skipping on a MATCH instead of a
+        /// mismatch), which silently waived ordinary ingredients any time a nearby station happened to
+        /// have some other extension attached, and conversely enforced genuine upgrade-marker slots
+        /// that vanilla itself would have waived - corrected here to mirror vanilla exactly.
         /// </summary>
         private static bool HaveIngredients(Player player, Recipe recipe, int qualityLevel, int amount,
                                             List<Box> boxes, out string why)
@@ -626,7 +626,7 @@ namespace NoVikingLeftBehind
                 foreach (var req in recipe.m_resources)
                 {
                     if (req == null) continue;
-                    if (station != null && station.m_upgrader == req.m_upgraderResource) continue;
+                    if (station != null && station.m_upgrader != req.m_upgraderResource) continue;
                     if (station == null && req.m_upgraderResource != null) continue;
                     if (!req.m_resItem) continue;
                     int need0 = req.GetAmount(qualityLevel) * amount;
@@ -646,7 +646,7 @@ namespace NoVikingLeftBehind
             foreach (var req in recipe.m_resources)
             {
                 if (req == null) continue;
-                if (station != null && station.m_upgrader == req.m_upgraderResource) continue;
+                if (station != null && station.m_upgrader != req.m_upgraderResource) continue;
                 if (station == null && req.m_upgraderResource != null) continue;
                 if (!req.m_resItem) continue;
                 int need = req.GetAmount(qualityLevel) * amount;
@@ -714,7 +714,7 @@ namespace NoVikingLeftBehind
                 foreach (var req in recipe.m_resources)
                 {
                     if (req == null) continue;
-                    if (station != null && station.m_upgrader == req.m_upgraderResource) continue;
+                    if (station != null && station.m_upgrader != req.m_upgraderResource) continue;
                     if (station == null && req.m_upgraderResource != null) continue;
                     if (!req.m_resItem) continue;
                     int need = req.GetAmount(qualityLevel) * craftMultiplier;
@@ -900,7 +900,7 @@ namespace NoVikingLeftBehind
                 {
                     var r = requirements[i];
                     if (r == null) continue;
-                    if (station != null && station.m_upgrader == r.m_upgraderResource) continue;
+                    if (station != null && station.m_upgrader != r.m_upgraderResource) continue;
                     if (station == null && r.m_upgraderResource != null) continue;
                     if (!r.m_resItem) continue;
 
