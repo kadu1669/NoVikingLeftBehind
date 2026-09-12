@@ -588,11 +588,32 @@ namespace NoVikingLeftBehind
         /// The chest-aware "do you have the materials" test, shared by HaveRecipePost and
         /// HaveRequirementItemsPost so the two can never disagree. Read-only: only counts
         /// containers, never touches one. <paramref name="why"/> is always set, for Diag().
+        ///
+        /// UPGRADE-EXTENSION REQUIREMENTS (field report: e.g. Flint Axe grey with plenty of wood
+        /// and flint in nearby chests, but craftable the instant every material - including this
+        /// one - sits in the bag instead)
+        /// ------------------------------------------------------------------------------------------
+        /// A Piece.Requirement can carry an `m_upgraderResource` - vanilla's own marker for "this slot
+        /// is waived once the right crafting-station extension/upgrade is attached", checked against
+        /// the current CraftingStation's own `m_upgrader`. Confirmed straight from Valheim's own
+        /// Player.HaveRequirementItems and Player.ConsumeResources (disassembled from the field
+        /// report's own game build, not inferred from a reference mod): both silently SKIP a
+        /// requirement whenever `station.m_upgrader == req.m_upgraderResource` (station has the
+        /// matching extension) or the player isn't at any station at all while the requirement carries
+        /// an upgrader resource. Skipped means skipped outright - no item, anywhere, ever needs to
+        /// satisfy it. Before this fix, HaveIngredients had no idea this waiver existed and treated
+        /// every such slot as an ordinary ingredient, checking inventory+containers for a "resource"
+        /// that is often a display/marker item nobody can ever actually carry - so the recipe stayed
+        /// permanently short specifically because of a requirement vanilla itself doesn't enforce. This
+        /// is also exactly why plain vanilla (or a well-behaved chest mod) crafted it fine once the
+        /// real materials reached the bag: vanilla's own waiver already covered this slot, and our
+        /// override, run only after vanilla itself said "no", was the one re-introducing it.
         /// </summary>
         private static bool HaveIngredients(Player player, Recipe recipe, int qualityLevel, int amount,
                                             List<Box> boxes, out string why)
         {
             var sb = _diag != null && _diag.Value ? new StringBuilder() : null;
+            var station = player.GetCurrentCraftingStation();
 
             // "Only one ingredient" recipes want ANY ONE of the listed items, not all of them - but
             // still the recipe's own GetAmount(qualityLevel) of whichever one is picked, times the
@@ -604,7 +625,10 @@ namespace NoVikingLeftBehind
             {
                 foreach (var req in recipe.m_resources)
                 {
-                    if (req == null || !req.m_resItem) continue;
+                    if (req == null) continue;
+                    if (station != null && station.m_upgrader == req.m_upgraderResource) continue;
+                    if (station == null && req.m_upgraderResource != null) continue;
+                    if (!req.m_resItem) continue;
                     int need0 = req.GetAmount(qualityLevel) * amount;
                     if (need0 <= 0) continue;
                     int have0 = Available(player, req, need0, boxes);
@@ -621,7 +645,10 @@ namespace NoVikingLeftBehind
 
             foreach (var req in recipe.m_resources)
             {
-                if (req == null || !req.m_resItem) continue;
+                if (req == null) continue;
+                if (station != null && station.m_upgrader == req.m_upgraderResource) continue;
+                if (station == null && req.m_upgraderResource != null) continue;
+                if (!req.m_resItem) continue;
                 int need = req.GetAmount(qualityLevel) * amount;
                 if (need <= 0) continue;
                 int have = Available(player, req, need, boxes);
@@ -679,9 +706,17 @@ namespace NoVikingLeftBehind
                 var boxes = ChestSource.Nearby(player.transform.position);
                 if (boxes.Count == 0) return;
 
+                // Same waiver as HaveIngredients/ConsumePost - see the class doc comment. Vanilla's
+                // own GetFirstRequiredItem has this same skip, so a listed "OR" choice that is really
+                // just a station-upgrade marker is never offered as the item to pull from a container.
+                var station = player.GetCurrentCraftingStation();
+
                 foreach (var req in recipe.m_resources)
                 {
-                    if (req == null || !req.m_resItem) continue;
+                    if (req == null) continue;
+                    if (station != null && station.m_upgrader == req.m_upgraderResource) continue;
+                    if (station == null && req.m_upgraderResource != null) continue;
+                    if (!req.m_resItem) continue;
                     int need = req.GetAmount(qualityLevel) * craftMultiplier;
                     if (need <= 0) continue;
 
@@ -854,10 +889,20 @@ namespace NoVikingLeftBehind
                 var boxes = ChestSource.Nearby(__instance.transform.position);
                 if (boxes.Count == 0) return;
 
+                // Mirrors Player.ConsumeResources' own waiver - see the class doc comment on
+                // HaveIngredients ("UPGRADE-EXTENSION REQUIREMENTS"). Vanilla itself never removes
+                // anything from the player for a waived slot, so without this we would try to pull
+                // its "shortfall" from a container anyway and log a spurious "charged short" warning
+                // for a requirement nobody actually owes.
+                var station = __instance.GetCurrentCraftingStation();
+
                 for (int i = 0; i < requirements.Length && i < __state.Length; i++)
                 {
                     var r = requirements[i];
-                    if (r == null || !r.m_resItem) continue;
+                    if (r == null) continue;
+                    if (station != null && station.m_upgrader == r.m_upgraderResource) continue;
+                    if (station == null && r.m_upgraderResource != null) continue;
+                    if (!r.m_resItem) continue;
 
                     int need = r.GetAmount(qualityLevel) * multiplier;
                     if (need <= 0) continue;
